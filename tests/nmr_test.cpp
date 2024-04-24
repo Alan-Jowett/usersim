@@ -157,7 +157,7 @@ NPI_PROVIDER_CHARACTERISTICS _test_provider_characteristics = {
 TEST_CASE("NmrRegisterClient", "[nmr]")
 {
     HANDLE nmr_client_handle;
-    
+
     REQUIRE(NmrRegisterClient(&_test_client_characteristics, nullptr, &nmr_client_handle) == STATUS_SUCCESS);
 
     // Verify there was no binding callback, since there are no providers.

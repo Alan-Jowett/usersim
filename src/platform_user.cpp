@@ -84,6 +84,7 @@ usersim_platform_initiate()
 
         usersim_initialize_se();
         usersim_initialize_wdf();
+        usersim_initialize_timers();
     } catch (const std::bad_alloc&) {
         result = STATUS_NO_MEMORY;
         goto Exit;
@@ -103,7 +104,7 @@ usersim_platform_terminate()
     cxplat_wait_for_preemptible_work_items_complete();
 
     usersim_free_semaphores();
-    usersim_free_threadpool_timers();
+    usersim_clean_up_timers();
     usersim_clean_up_dpcs();
     usersim_clean_up_irql();
     if (_cxplat_initialized) {

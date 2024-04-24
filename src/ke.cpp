@@ -6,6 +6,7 @@
 #include "utilities.h"
 
 #include <format>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <vector>
@@ -679,38 +680,148 @@ usersim_clean_up_dpcs()
 #pragma endregion dpcs
 #pragma region timers
 
-// The following mutex currently protects two things that can contain a pointer to a TP_TIMER:
-// 1) the g_usersim_threadpool_timers list, and
-// 2) each KTIMER's threadpool_timer member.
-static std::mutex g_usersim_threadpool_mutex;
+static std::mutex g_usersim_timer_mutex;
+static LIST_ENTRY g_usersim_timers = {&g_usersim_timers, &g_usersim_timers};
+static HANDLE g_usersim_waitable_timer = nullptr;
+static HANDLE g_usersim_timer_wakeup_event = nullptr;
+static std::thread g_usersim_timer_thread;
+static std::atomic<bool> g_usersim_timer_cleanup = false;
 
-// The following is a list of all TP_TIMER objects that are in use.
-static std::vector<TP_TIMER*>* g_usersim_threadpool_timers = nullptr;
+static
+void _timer_thread();
+
+void
+usersim_initialize_timers()
+{
+    g_usersim_waitable_timer = CreateWaitableTimer(nullptr, FALSE, nullptr);
+    ASSERT(g_usersim_waitable_timer != nullptr);
+    g_usersim_timer_wakeup_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    ASSERT(g_usersim_timer_wakeup_event != nullptr);
+
+    g_usersim_timers = {&g_usersim_timers, &g_usersim_timers};
+    g_usersim_timer_cleanup = false;
+    g_usersim_timer_thread = std::thread(_timer_thread);
+}
+
+void
+usersim_clean_up_timers()
+{
+    g_usersim_timer_cleanup = true;
+    SetEvent(g_usersim_timer_wakeup_event);
+    if (g_usersim_timer_thread.joinable()) {
+        g_usersim_timer_thread.join();
+    }
+    CloseHandle(g_usersim_waitable_timer);
+    CloseHandle(g_usersim_timer_wakeup_event);
+}
+
+_Requires_lock_held_(g_usersim_timer_mutex)
+static
+bool _remove_timer(_In_ PKTIMER timer)
+{
+    bool already_set = IsListEmpty(&timer->list_entry) == FALSE;
+
+    RemoveEntryList(&timer->list_entry);
+    InitializeListHead(&timer->list_entry);
+
+    SetEvent(g_usersim_timer_wakeup_event);
+
+    return already_set;
+}
+
+_Requires_lock_held_(g_usersim_timer_mutex)
+static
+bool _insert_timer(_In_ PKTIMER timer)
+{
+    bool already_set = _remove_timer(timer);
+
+    // Find location in the list to insert the timer.
+    auto head = &g_usersim_timers;
+    auto current = g_usersim_timers.Flink;
+    while (current != &g_usersim_timers) {
+        PKTIMER current_timer = CONTAINING_RECORD(current, KTIMER, list_entry);
+        if (current_timer->due_time.QuadPart > timer->due_time.QuadPart) {
+            break;
+        }
+        current = current->Flink;
+    }
+    // Insert the timer.
+    InsertTailList(current, &timer->list_entry);
+
+    SetEvent(g_usersim_timer_wakeup_event);
+
+    return already_set;
+}
+
+
+
+static
+void _timer_thread()
+{
+    // Set the thread priority to the highest level.
+    bool result = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    ASSERT(result);
+    for (;;) {
+        // Wait on both the timer and the event.
+        HANDLE wait_handles[2] = {g_usersim_waitable_timer, g_usersim_timer_wakeup_event};
+
+        DWORD wait_result = WaitForMultipleObjects(2, wait_handles, FALSE, INFINITE);
+
+        // Process all timers that have expired.
+        std::unique_lock<std::mutex> l(g_usersim_timer_mutex);
+
+        uint64_t current_time;
+        QueryInterruptTime(&current_time);
+        while (!IsListEmpty(&g_usersim_timers)) {
+            PKTIMER timer = CONTAINING_RECORD(g_usersim_timers.Flink, KTIMER, list_entry);
+            if (timer->due_time.QuadPart > current_time) {
+                break;
+            }
+
+            _remove_timer(timer);
+
+            // Signal the timer.
+            timer->signaled = TRUE;
+            if (timer->dpc != nullptr) {
+                KeInsertQueueDpc(timer->dpc, nullptr, nullptr);
+            }
+
+            if (timer->period == 0) {
+                // If the timer is not periodic, we are done.
+                continue;
+            }
+
+            // If the timer is periodic, set the next due time.
+            timer->due_time.QuadPart = current_time + timer->period * 10000;
+
+            _insert_timer(timer);
+        }
+
+        // If the cleanup flag is set, exit the thread.
+        if (g_usersim_timer_cleanup) {
+            return;
+        }
+
+        // If there are no timers left, wait for the next timer to be set.
+        if (IsListEmpty(&g_usersim_timers)) {
+            ResetEvent(g_usersim_timer_wakeup_event);
+
+            continue;
+        }
+
+        // Set the next timer.
+        PKTIMER next_timer = CONTAINING_RECORD(g_usersim_timers.Flink, KTIMER, list_entry);
+        LARGE_INTEGER due_time = next_timer->due_time;
+        SetWaitableTimer(g_usersim_waitable_timer, &due_time, 0, nullptr, nullptr, FALSE);
+    }
+}
 
 void
 KeInitializeTimer(_Out_ PKTIMER timer)
 {
     memset(timer, 0, sizeof(*timer));
     timer->object_type = USERSIM_OBJECT_TYPE_TIMER;
-}
-
-VOID CALLBACK
-_usersim_timer_callback(
-    _Inout_ PTP_CALLBACK_INSTANCE instance, _Inout_opt_ PVOID context, _Inout_ PTP_TIMER threadpool_timer)
-{
-    UNREFERENCED_PARAMETER(instance);
-    UNREFERENCED_PARAMETER(threadpool_timer);
-
-    PKTIMER timer = (PKTIMER)context;
-    if (timer == nullptr) {
-        return;
-    }
-    ASSERT(timer->object_type == USERSIM_OBJECT_TYPE_TIMER);
-    timer->signaled = TRUE;
-
-    if (timer->dpc) {
-        KeInsertQueueDpc(timer->dpc, timer->dpc->parameter_1, timer->dpc->parameter_2);
-    }
+    InitializeListHead(&timer->list_entry);
 }
 
 BOOLEAN
@@ -729,77 +840,37 @@ BOOLEAN
 KeSetCoalescableTimer(
     _Inout_ PKTIMER timer, LARGE_INTEGER due_time, ULONG period, ULONG tolerable_delay, _In_opt_ PKDPC dpc)
 {
+    std::unique_lock<std::mutex> l(g_usersim_timer_mutex);
+
     ASSERT(dpc != nullptr);
     ASSERT(timer->object_type == USERSIM_OBJECT_TYPE_TIMER);
 
-    // We currently only support relative expiration times.
-    ASSERT(due_time.QuadPart < 0);
-
-    std::unique_lock<std::mutex> l(g_usersim_threadpool_mutex);
-    BOOLEAN running = (timer->threadpool_timer != nullptr);
-    if (!running) {
-        timer->threadpool_timer = CreateThreadpoolTimer(_usersim_timer_callback, timer, nullptr);
-        if (timer->threadpool_timer == nullptr) {
-            KeBugCheck(0);
-            return FALSE; // Keep code analysis happy.
-        }
-
-        // There is no kernel function to clean up a timer, but there is in user mode,
-        // so add the handle to a list we can clean up later.
-        if (g_usersim_threadpool_timers == nullptr) {
-            g_usersim_threadpool_timers = new std::vector<TP_TIMER*>();
-        }
-        g_usersim_threadpool_timers->push_back(timer->threadpool_timer);
+    // Relative timer
+    if (due_time.QuadPart <= 0) {
+        uint64_t current_time;
+        QueryInterruptTime(&current_time);
+        due_time.QuadPart = current_time - due_time.QuadPart;
     }
 
+    timer->due_time = due_time;
+    timer->period = period;
     timer->signaled = FALSE;
     timer->dpc = dpc;
-    SetThreadpoolTimer(timer->threadpool_timer, (FILETIME*)&due_time, period, tolerable_delay);
 
-    return running;
-}
-
-void
-usersim_free_threadpool_timers()
-{
-    std::unique_lock<std::mutex> l(g_usersim_threadpool_mutex);
-    if (g_usersim_threadpool_timers) {
-        for (TP_TIMER* threadpool_timer : *g_usersim_threadpool_timers) {
-            CloseThreadpoolTimer(threadpool_timer);
-        }
-        delete g_usersim_threadpool_timers;
-        g_usersim_threadpool_timers = nullptr;
-    }
+    return _insert_timer(timer) ? TRUE : FALSE;
 }
 
 BOOLEAN
 KeCancelTimer(_Inout_ PKTIMER timer)
 {
+    std::unique_lock<std::mutex> l(g_usersim_timer_mutex);
     ASSERT(timer->object_type == USERSIM_OBJECT_TYPE_TIMER);
 
-    std::unique_lock<std::mutex> l(g_usersim_threadpool_mutex);
-    if (timer->threadpool_timer == nullptr) {
-        return FALSE;
-    }
-
-    // Stop generating new callbacks.
-    SetThreadpoolTimer(timer->threadpool_timer, nullptr, 0, 0);
-
-    // Cancel any queued callbacks that have not yet started to execute.
-    WaitForThreadpoolTimerCallbacks(timer->threadpool_timer, TRUE);
-
-    // Clean up timer.
-    auto iterator =
-        std::find(g_usersim_threadpool_timers->begin(), g_usersim_threadpool_timers->end(), timer->threadpool_timer);
-    ASSERT(iterator != g_usersim_threadpool_timers->end());
-    g_usersim_threadpool_timers->erase(iterator);
-    CloseThreadpoolTimer(timer->threadpool_timer);
-    timer->threadpool_timer = nullptr;
-
-    // Return TRUE if the timer was running.
-    BOOLEAN was_running = !timer->signaled;
+    timer->due_time.QuadPart = 0;
+    timer->period = 0;
     timer->signaled = FALSE;
-    return was_running;
+
+    return _remove_timer(timer) ? TRUE : FALSE;
 }
 
 // Check whether the current state is signaled.

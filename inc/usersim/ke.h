@@ -298,7 +298,9 @@ usersim_clean_up_dpcs();
 typedef struct _ktimer
 {
     usersim_object_type_t object_type;
-    TP_TIMER* threadpool_timer;
+    LIST_ENTRY list_entry;
+    LARGE_INTEGER due_time;
+    ULONG period;
     KDPC* dpc;
     BOOLEAN signaled;
 } KTIMER;
@@ -330,7 +332,10 @@ BOOLEAN
 KeReadStateTimer(_In_ PKTIMER timer);
 
 void
-usersim_free_threadpool_timers();
+usersim_initialize_timers();
+
+void
+usersim_clean_up_timers();
 
 #pragma endregion timers
 
