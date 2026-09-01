@@ -74,6 +74,7 @@
   <ItemGroup>
     <ClCompile Include="etw_test.cpp" />
     <ClCompile Include="ex_test.cpp" />
+    <ClCompile Include="fault_injection_test.cpp" />
     <ClCompile Include="io_test.cpp" />
     <ClCompile Include="ke_test.cpp" />
     <ClCompile Include="mm_test.cpp" />
